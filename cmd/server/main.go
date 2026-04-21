@@ -18,6 +18,7 @@ import (
 
 	"github.com/joho/godotenv"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/branding"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -45,7 +46,8 @@ var (
 // init initializes the shared logger setup.
 func init() {
 	logging.SetupBaseLogger()
-	buildinfo.Version = Version
+	buildinfo.RawVersion = Version
+	buildinfo.Version = branding.NormalizeVersion(Version).Display
 	buildinfo.Commit = Commit
 	buildinfo.BuildDate = BuildDate
 }
@@ -54,7 +56,13 @@ func init() {
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
-	fmt.Printf("CPA-UV Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	fmt.Printf(
+		"CPA-UV Version: %s, RawVersion: %s, Commit: %s, BuiltAt: %s\n",
+		buildinfo.Version,
+		buildinfo.RawVersion,
+		buildinfo.Commit,
+		buildinfo.BuildDate,
+	)
 
 	// Command-line flags to control the application's behavior.
 	var login bool
@@ -425,7 +433,13 @@ func main() {
 		return
 	}
 
-	log.Infof("CPA-UV Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	log.Infof(
+		"CPA-UV Version: %s, RawVersion: %s, Commit: %s, BuiltAt: %s",
+		buildinfo.Version,
+		buildinfo.RawVersion,
+		buildinfo.Commit,
+		buildinfo.BuildDate,
+	)
 
 	// Set the log level based on the configuration.
 	util.SetLogLevel(cfg)

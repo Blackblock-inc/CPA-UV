@@ -301,6 +301,50 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 	return true
 }
 
+func ResolveReleaseURL(repo string) string {
+	return resolveReleaseURL(repo)
+}
+
+func ResolveRepositoryURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return branding.RepoURL
+	}
+
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Host == "" {
+		return branding.RepoURL
+	}
+
+	host := strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	if host == "github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			repoName := strings.TrimSuffix(parts[1], ".git")
+			return fmt.Sprintf("https://github.com/%s/%s", parts[0], repoName)
+		}
+	}
+
+	if host == "api.github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 3 && parts[0] == "repos" && parts[1] != "" && parts[2] != "" {
+			return fmt.Sprintf("https://github.com/%s/%s", parts[1], parts[2])
+		}
+	}
+
+	return branding.RepoURL
+}
+
+func ResolveLatestReleasePageURL(repo string) string {
+	return strings.TrimSuffix(ResolveRepositoryURL(repo), "/") + "/releases/latest"
+}
+
+func ResolveManagementSourceURL(repo string) string {
+	return strings.TrimSuffix(ResolveRepositoryURL(repo), "/") + "/blob/main/assets/management.html"
+}
+
 func resolveReleaseURL(repo string) string {
 	repo = strings.TrimSpace(repo)
 	if repo == "" {

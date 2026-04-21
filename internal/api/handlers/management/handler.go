@@ -48,6 +48,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	updateMu            sync.Mutex
+	updateInProgress    bool
 }
 
 // NewHandler creates a new management handler instance.
