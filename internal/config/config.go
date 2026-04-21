@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/branding"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -20,7 +21,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/Blackblock-inc/CPA-UV"
+	DefaultPanelGitHubRepository = branding.RepoURL
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 

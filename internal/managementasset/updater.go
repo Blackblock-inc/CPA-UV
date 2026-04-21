@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/branding"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -25,8 +26,8 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/Blackblock-inc/CPA-UV/releases/latest"
-	defaultManagementFallbackURL = "https://github.com/Blackblock-inc/CPA-UV/releases/latest/download/management.html"
+	defaultManagementReleaseURL  = branding.LatestReleaseAPIURL
+	defaultManagementFallbackURL = branding.LatestManagementAssetURL
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CPA-UV-management-updater"
 	managementSyncMinInterval    = 30 * time.Second

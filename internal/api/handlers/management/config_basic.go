@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/branding"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	latestReleaseURL       = "https://api.github.com/repos/Blackblock-inc/CPA-UV/releases/latest"
+	latestReleaseURL       = branding.LatestReleaseAPIURL
 	latestReleaseUserAgent = "CPA-UV"
 )
 
