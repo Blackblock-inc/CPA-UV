@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -38,6 +39,8 @@ const (
 	updateExecutableBaseName = "cli-proxy-api"
 )
 
+var managementVersionPattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+){2}-uv\s*\(\d+(?:\.\d+)*\)`)
+
 type releaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
@@ -59,17 +62,23 @@ type versionSnapshot struct {
 }
 
 type latestVersionResponse struct {
-	Repository       string          `json:"repository"`
-	ReleasePage      string          `json:"release-page"`
-	ManagementSource string          `json:"management-source"`
-	InstallSupported bool            `json:"install-supported"`
-	UpdateAvailable  bool            `json:"update-available"`
-	InstallNote      string          `json:"install-note,omitempty"`
-	AssetName        string          `json:"asset-name,omitempty"`
-	Current          versionSnapshot `json:"current"`
-	Latest           versionSnapshot `json:"latest"`
-	CurrentVersion   string          `json:"current-version"`
-	LatestVersion    string          `json:"latest-version"`
+	Repository                string          `json:"repository"`
+	ReleasePage               string          `json:"release-page"`
+	ManagementSource          string          `json:"management-source"`
+	InstallSupported          bool            `json:"install-supported"`
+	UpdateAvailable           bool            `json:"update-available"`
+	ServerUpdateAvailable     bool            `json:"server-update-available"`
+	ManagementUpdateAvailable bool            `json:"management-update-available"`
+	InstallNote               string          `json:"install-note,omitempty"`
+	AssetName                 string          `json:"asset-name,omitempty"`
+	Current                   versionSnapshot `json:"current"`
+	Latest                    versionSnapshot `json:"latest"`
+	CurrentVersion            string          `json:"current-version"`
+	LatestVersion             string          `json:"latest-version"`
+	ManagementCurrent         versionSnapshot `json:"management-current"`
+	ManagementLatest          versionSnapshot `json:"management-latest"`
+	ManagementCurrentVersion  string          `json:"management-current-version,omitempty"`
+	ManagementLatestVersion   string          `json:"management-latest-version,omitempty"`
 }
 
 type preparedUpdate struct {
@@ -175,18 +184,47 @@ func (h *Handler) buildLatestVersionResponseForInstall(ctx context.Context) (*la
 	if archiveAsset == nil && installNote == "" {
 		installNote = fmt.Sprintf("no update package found for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
+	serverUpdateAvailable := branding.CompareVersions(latest.RawVersion, current.RawVersion) > 0
+	managementCurrent := h.currentManagementVersion()
+	managementLatest := versionSnapshot{}
+	managementLatestVersion := ""
+	managementUpdateAvailable := false
+
+	if managementHTMLAsset := selectManagementAsset(release.Assets); managementHTMLAsset != nil {
+		client := newUpdateHTTPClient(h.proxyURL())
+		panelData, _, errDownload := downloadReleaseAsset(ctx, client, *managementHTMLAsset)
+		if errDownload != nil {
+			log.WithError(errDownload).Warn("failed to download latest management asset for version check")
+		} else {
+			managementLatest = buildManagementVersionSnapshot(extractManagementVersionFromHTML(panelData))
+			managementLatestVersion = strings.TrimSpace(managementLatest.DisplayVersion)
+			if managementCurrent.RawVersion != "" && managementLatest.RawVersion != "" {
+				managementUpdateAvailable = branding.CompareManagementVersions(
+					managementLatest.RawVersion,
+					managementCurrent.RawVersion,
+				) > 0
+			}
+		}
+	}
+
 	response := &latestVersionResponse{
-		Repository:       repoURL,
-		ReleasePage:      firstNonEmpty(strings.TrimSpace(release.HTMLURL), releasePage),
-		ManagementSource: managementasset.ResolveManagementSourceURL(repoURL),
-		InstallSupported: archiveAsset != nil,
-		UpdateAvailable:  branding.CompareVersions(latest.RawVersion, current.RawVersion) > 0,
-		InstallNote:      installNote,
-		AssetName:        assetName(archiveAsset),
-		Current:          current,
-		Latest:           latest,
-		CurrentVersion:   current.DisplayVersion,
-		LatestVersion:    latest.DisplayVersion,
+		Repository:                repoURL,
+		ReleasePage:               firstNonEmpty(strings.TrimSpace(release.HTMLURL), releasePage),
+		ManagementSource:          managementasset.ResolveManagementSourceURL(repoURL),
+		InstallSupported:          archiveAsset != nil,
+		UpdateAvailable:           serverUpdateAvailable || managementUpdateAvailable,
+		ServerUpdateAvailable:     serverUpdateAvailable,
+		ManagementUpdateAvailable: managementUpdateAvailable,
+		InstallNote:               installNote,
+		AssetName:                 assetName(archiveAsset),
+		Current:                   current,
+		Latest:                    latest,
+		CurrentVersion:            current.DisplayVersion,
+		LatestVersion:             latest.DisplayVersion,
+		ManagementCurrent:         managementCurrent,
+		ManagementLatest:          managementLatest,
+		ManagementCurrentVersion:  strings.TrimSpace(managementCurrent.DisplayVersion),
+		ManagementLatestVersion:   managementLatestVersion,
 	}
 	return response, release, archiveAsset, nil
 }
@@ -199,6 +237,43 @@ func buildVersionSnapshot(raw string) versionSnapshot {
 		BaselineVersion: info.BaselineVersion,
 		UVVersion:       info.UVVersion,
 	}
+}
+
+func buildManagementVersionSnapshot(raw string) versionSnapshot {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return versionSnapshot{}
+	}
+
+	info := branding.NormalizeManagementVersion(raw)
+	return versionSnapshot{
+		RawVersion:      raw,
+		DisplayVersion:  info.Display,
+		BaselineVersion: info.BaselineVersion,
+		UVVersion:       info.UVVersion,
+	}
+}
+
+func extractManagementVersionFromHTML(data []byte) string {
+	match := managementVersionPattern.Find(data)
+	if len(match) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(string(match))
+}
+
+func (h *Handler) currentManagementVersion() versionSnapshot {
+	path := managementasset.FilePath(h.configFilePath)
+	if strings.TrimSpace(path) == "" {
+		return versionSnapshot{}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return versionSnapshot{}
+	}
+
+	return buildManagementVersionSnapshot(extractManagementVersionFromHTML(data))
 }
 
 func (h *Handler) fetchLatestReleaseInfo(ctx context.Context) (*githubReleaseInfo, string, string, error) {

@@ -8,6 +8,14 @@ import (
 )
 
 const DefaultBaselineVersion = "6.9.31"
+const DefaultManagementBaselineVersion = "1.7.41"
+
+type mismatchStrategy string
+
+const (
+	mismatchStrategyBaselineAsUV mismatchStrategy = "baseline-as-uv"
+	mismatchStrategyPreserveUV   mismatchStrategy = "preserve-uv"
+)
 
 var (
 	baselineUVVersionPattern = regexp.MustCompile(`(?i)^v?(\d+(?:\.\d+){2})(?:[-_.]?uv[-_.]?(\d+(?:[-_.]\d+)*))?$`)
@@ -25,6 +33,14 @@ type VersionInfo struct {
 }
 
 func NormalizeVersion(raw string) VersionInfo {
+	return normalizeVersion(raw, DefaultBaselineVersion, mismatchStrategyBaselineAsUV)
+}
+
+func NormalizeManagementVersion(raw string) VersionInfo {
+	return normalizeVersion(raw, DefaultManagementBaselineVersion, mismatchStrategyPreserveUV)
+}
+
+func normalizeVersion(raw string, baselineVersion string, strategy mismatchStrategy) VersionInfo {
 	raw = normalizeVersionSource(raw)
 	if raw == "" {
 		return VersionInfo{Display: "unknown"}
@@ -45,9 +61,13 @@ func NormalizeVersion(raw string) VersionInfo {
 	if matches := baselineUVVersionPattern.FindStringSubmatch(raw); len(matches) == 3 {
 		baseline := matches[1]
 		uvVersion := normalizeUVVersion(matches[2])
-		if baseline != DefaultBaselineVersion {
-			uvVersion = normalizeUVVersion(baseline)
-			baseline = DefaultBaselineVersion
+		if baseline != baselineVersion {
+			if strategy == mismatchStrategyPreserveUV && uvVersion != "" {
+				baseline = baselineVersion
+			} else {
+				uvVersion = normalizeUVVersion(baseline)
+				baseline = baselineVersion
+			}
 		} else if uvVersion == "" {
 			uvVersion = "1.0.0"
 		}
@@ -61,7 +81,7 @@ func NormalizeVersion(raw string) VersionInfo {
 	}
 
 	if matches := uvOnlyVersionPattern.FindStringSubmatch(raw); len(matches) == 2 {
-		baseline := DefaultBaselineVersion
+		baseline := baselineVersion
 		uvVersion := normalizeUVVersion(matches[1])
 		return VersionInfo{
 			Raw:             raw,
@@ -96,6 +116,12 @@ func normalizeVersionSource(raw string) string {
 func CompareVersions(leftRaw, rightRaw string) int {
 	left := NormalizeVersion(leftRaw)
 	right := NormalizeVersion(rightRaw)
+	return compareVersionParts(left.comparableParts, right.comparableParts)
+}
+
+func CompareManagementVersions(leftRaw, rightRaw string) int {
+	left := NormalizeManagementVersion(leftRaw)
+	right := NormalizeManagementVersion(rightRaw)
 	return compareVersionParts(left.comparableParts, right.comparableParts)
 }
 
