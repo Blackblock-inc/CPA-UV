@@ -1,6 +1,9 @@
 package management
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractManagementVersionFromHTML(t *testing.T) {
 	t.Parallel()
@@ -81,5 +84,26 @@ func TestParseReleaseAssetsFromHTML(t *testing.T) {
 	}
 	if assets[1].Digest != "sha256:2222222222222222222222222222222222222222222222222222222222222222" {
 		t.Fatalf("assets[1].Digest = %q", assets[1].Digest)
+	}
+}
+
+func TestBuildWindowsInstallerScript(t *testing.T) {
+	t.Parallel()
+
+	script := buildWindowsInstallerScript()
+	requiredSnippets := []string{
+		"$logPath = Join-Path $PSScriptRoot 'install-update.log'",
+		"function Invoke-WithRetry",
+		"stage replacement executable",
+		"replace executable",
+		"restart executable",
+		"installer finished successfully",
+		"restored backup executable after failure",
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(script, snippet) {
+			t.Fatalf("buildWindowsInstallerScript() missing %q", snippet)
+		}
 	}
 }

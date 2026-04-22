@@ -534,9 +534,6 @@ func (h *Handler) prepareUpdate(ctx context.Context, release *githubReleaseInfo,
 	}
 
 	workingDirectory := filepath.Dir(executablePath)
-	if wd, errWD := os.Getwd(); errWD == nil && strings.TrimSpace(wd) != "" {
-		workingDirectory = wd
-	}
 
 	workDir, err := os.MkdirTemp("", "cpa-uv-update-*")
 	if err != nil {
@@ -607,52 +604,7 @@ func launchInstaller(prepared *preparedUpdate) error {
 
 func launchWindowsInstaller(prepared *preparedUpdate) error {
 	scriptPath := filepath.Join(prepared.workDir, updateInstallScriptName+".ps1")
-	script := `$ErrorActionPreference = 'Stop'
-param(
-  [int]$ParentPid,
-  [string]$ExecutablePath,
-  [string]$ReplacementPath,
-  [string]$PanelPath,
-  [string]$PanelTarget,
-  [string]$ArgsPath,
-  [string]$WorkingDirectory
-)
-
-for ($i = 0; $i -lt 240; $i++) {
-  if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
-    break
-  }
-  Start-Sleep -Milliseconds 500
-}
-
-$backupPath = "$ExecutablePath.old"
-if (Test-Path -LiteralPath $backupPath) {
-  Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-}
-if (Test-Path -LiteralPath $ExecutablePath) {
-  Move-Item -LiteralPath $ExecutablePath -Destination $backupPath -Force
-}
-Copy-Item -LiteralPath $ReplacementPath -Destination $ExecutablePath -Force
-
-if ($PanelPath -and $PanelTarget) {
-  $panelDir = Split-Path -Parent $PanelTarget
-  if ($panelDir) {
-    New-Item -ItemType Directory -Force -Path $panelDir | Out-Null
-  }
-  Copy-Item -LiteralPath $PanelPath -Destination $PanelTarget -Force
-}
-
-$argList = @()
-if ($ArgsPath -and (Test-Path -LiteralPath $ArgsPath)) {
-  $argList = @(Get-Content -LiteralPath $ArgsPath)
-}
-
-Start-Process -FilePath $ExecutablePath -WorkingDirectory $WorkingDirectory -ArgumentList $argList -WindowStyle Hidden | Out-Null
-
-if (Test-Path -LiteralPath $backupPath) {
-  Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-}
-`
+	script := buildWindowsInstallerScript()
 	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
 		return fmt.Errorf("write windows install script: %w", err)
 	}
@@ -677,6 +629,129 @@ if (Test-Path -LiteralPath $backupPath) {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Start()
+}
+
+func buildWindowsInstallerScript() string {
+	return `param(
+  [int]$ParentPid,
+  [string]$ExecutablePath,
+  [string]$ReplacementPath,
+  [string]$PanelPath,
+  [string]$PanelTarget,
+  [string]$ArgsPath,
+  [string]$WorkingDirectory
+)
+
+$ErrorActionPreference = 'Stop'
+$logPath = Join-Path $PSScriptRoot 'install-update.log'
+
+function Write-InstallerLog {
+  param([string]$Message)
+  $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+  Add-Content -LiteralPath $logPath -Value "[$timestamp] $Message"
+}
+
+function Invoke-WithRetry {
+  param(
+    [string]$Operation,
+    [scriptblock]$Action,
+    [int]$MaxAttempts = 120,
+    [int]$DelayMilliseconds = 500
+  )
+
+  $lastErrorMessage = ''
+  for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+    try {
+      & $Action
+      if ($attempt -gt 1) {
+        Write-InstallerLog("$Operation succeeded on attempt $attempt")
+      }
+      return
+    } catch {
+      $lastErrorMessage = $_.Exception.Message
+      Write-InstallerLog("$Operation attempt $attempt failed: $lastErrorMessage")
+      Start-Sleep -Milliseconds $DelayMilliseconds
+    }
+  }
+
+  throw "$Operation failed after $MaxAttempts attempts: $lastErrorMessage"
+}
+
+Write-InstallerLog("installer started for $ExecutablePath with parent pid $ParentPid")
+
+for ($i = 0; $i -lt 240; $i++) {
+  if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
+    Write-InstallerLog("detected parent process exit after $i wait iterations")
+    break
+  }
+  Start-Sleep -Milliseconds 500
+}
+
+$backupPath = "$ExecutablePath.old"
+$stagedPath = "$ExecutablePath.new"
+
+try {
+  if (Test-Path -LiteralPath $backupPath) {
+    Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+  }
+
+  Invoke-WithRetry 'stage replacement executable' {
+    Copy-Item -LiteralPath $ReplacementPath -Destination $stagedPath -Force
+  }
+
+  Invoke-WithRetry 'replace executable' {
+    if (-not (Test-Path -LiteralPath $backupPath) -and (Test-Path -LiteralPath $ExecutablePath)) {
+      Move-Item -LiteralPath $ExecutablePath -Destination $backupPath -Force
+    }
+    if (Test-Path -LiteralPath $ExecutablePath) {
+      throw 'target executable still exists while waiting for replacement'
+    }
+    if (-not (Test-Path -LiteralPath $stagedPath)) {
+      Copy-Item -LiteralPath $ReplacementPath -Destination $stagedPath -Force
+    }
+    Move-Item -LiteralPath $stagedPath -Destination $ExecutablePath -Force
+  }
+
+  if ($PanelPath -and $PanelTarget) {
+    Invoke-WithRetry 'replace management panel' {
+      $panelDir = Split-Path -Parent $PanelTarget
+      if ($panelDir) {
+        New-Item -ItemType Directory -Force -Path $panelDir | Out-Null
+      }
+      Copy-Item -LiteralPath $PanelPath -Destination $PanelTarget -Force
+    }
+  }
+
+  $argList = @()
+  if ($ArgsPath -and (Test-Path -LiteralPath $ArgsPath)) {
+    $argList = @(Get-Content -LiteralPath $ArgsPath)
+  }
+
+  Invoke-WithRetry 'restart executable' {
+    Start-Process -FilePath $ExecutablePath -WorkingDirectory $WorkingDirectory -ArgumentList $argList -WindowStyle Hidden | Out-Null
+  }
+
+  if (Test-Path -LiteralPath $backupPath) {
+    Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path -LiteralPath $stagedPath) {
+    Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+  }
+
+  Write-InstallerLog('installer finished successfully')
+} catch {
+  Write-InstallerLog("installer failed: $($_.Exception.Message)")
+  if (-not (Test-Path -LiteralPath $ExecutablePath) -and (Test-Path -LiteralPath $backupPath)) {
+    try {
+      Move-Item -LiteralPath $backupPath -Destination $ExecutablePath -Force
+      Write-InstallerLog('restored backup executable after failure')
+    } catch {
+      Write-InstallerLog("failed to restore backup executable: $($_.Exception.Message)")
+    }
+  }
+  throw
+}
+`
 }
 
 func launchUnixInstaller(prepared *preparedUpdate) error {
