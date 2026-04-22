@@ -10,10 +10,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -32,6 +35,7 @@ import (
 const (
 	updateReleaseUserAgent   = "CPA-UV-updater"
 	maxReleaseDownloadSize   = 128 << 20
+	maxReleaseMetadataSize   = 2 << 20
 	selfExitDelay            = 1500 * time.Millisecond
 	updateInstallScriptName  = "install-update"
 	updateArchiveWindowsExt  = ".zip"
@@ -39,7 +43,15 @@ const (
 	updateExecutableBaseName = "cli-proxy-api"
 )
 
-var managementVersionPattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+){2}-uv\s*\(\d+(?:\.\d+)*\)`)
+var (
+	managementVersionPattern  = regexp.MustCompile(`(?i)\b\d+(?:\.\d+){2}-uv\s*\(\d+(?:\.\d+)*\)`)
+	releaseTagPathPattern     = regexp.MustCompile(`/releases/tag/([^/?#"'>]+)`)
+	releaseTitlePattern       = regexp.MustCompile(`(?is)<title>\s*Release\s+([^<]+?)\s*[·-]`)
+	releaseAssetRowPattern    = regexp.MustCompile(`(?is)<li\b[^>]*>(.*?)</li>`)
+	releaseAssetHrefPattern   = regexp.MustCompile(`href="([^"]*/releases/download/[^"]+)"`)
+	releaseAssetNamePattern   = regexp.MustCompile(`(?is)<span[^>]*class="[^"]*Truncate-text text-bold[^"]*"[^>]*>([^<]+)</span>`)
+	releaseAssetDigestPattern = regexp.MustCompile(`value="sha256:([0-9a-fA-F]{64})"`)
+)
 
 type releaseAsset struct {
 	Name               string `json:"name"`
@@ -282,16 +294,40 @@ func (h *Handler) fetchLatestReleaseInfo(ctx context.Context) (*githubReleaseInf
 	releasePage := managementasset.ResolveLatestReleasePageURL(repoURL)
 	client := newUpdateHTTPClient(h.proxyURL())
 
+	release, err := fetchLatestReleaseInfoFromAPI(ctx, client, releaseURL)
+	if err == nil {
+		return release, repoURL, releasePage, nil
+	}
+
+	log.WithError(err).Warn("failed to query latest release API, falling back to release page")
+	release, fallbackPage, fallbackErr := fetchLatestReleaseInfoFromReleasePage(
+		ctx,
+		client,
+		repoURL,
+		releasePage,
+	)
+	if fallbackErr != nil {
+		return nil, "", "", fmt.Errorf("query latest release API: %w; release page fallback: %v", err, fallbackErr)
+	}
+
+	return release, repoURL, firstNonEmpty(strings.TrimSpace(release.HTMLURL), fallbackPage, releasePage), nil
+}
+
+func fetchLatestReleaseInfoFromAPI(
+	ctx context.Context,
+	client *http.Client,
+	releaseURL string,
+) (*githubReleaseInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseURL, nil)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("create release request: %w", err)
+		return nil, fmt.Errorf("create release request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", updateReleaseUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("request latest release: %w", err)
+		return nil, fmt.Errorf("request latest release: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -299,15 +335,188 @@ func (h *Handler) fetchLatestReleaseInfo(ctx context.Context) (*githubReleaseInf
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, "", "", fmt.Errorf("unexpected release status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("unexpected release status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var release githubReleaseInfo
 	if err = json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return nil, "", "", fmt.Errorf("decode release response: %w", err)
+		return nil, fmt.Errorf("decode release response: %w", err)
 	}
 
-	return &release, repoURL, releasePage, nil
+	return &release, nil
+}
+
+func fetchLatestReleaseInfoFromReleasePage(
+	ctx context.Context,
+	client *http.Client,
+	repoURL string,
+	releasePage string,
+) (*githubReleaseInfo, string, error) {
+	pageData, finalPageURL, err := fetchReleasePageDocument(ctx, client, releasePage)
+	if err != nil {
+		return nil, "", err
+	}
+
+	tag := extractReleaseTag(finalPageURL, pageData)
+	if tag == "" {
+		return nil, finalPageURL, fmt.Errorf("extract release tag from %s", finalPageURL)
+	}
+
+	assetsPageURL := buildExpandedAssetsURL(repoURL, tag)
+	if assetsPageURL == "" {
+		return nil, finalPageURL, fmt.Errorf("build expanded assets url from %s", repoURL)
+	}
+
+	assetsData, _, err := fetchReleasePageDocument(ctx, client, assetsPageURL)
+	if err != nil {
+		return nil, finalPageURL, fmt.Errorf("request expanded assets page: %w", err)
+	}
+
+	assets := parseReleaseAssetsFromHTML(assetsData, finalPageURL)
+	if len(assets) == 0 {
+		return nil, finalPageURL, fmt.Errorf("no release assets found on %s", assetsPageURL)
+	}
+
+	return &githubReleaseInfo{
+		TagName: tag,
+		Name:    tag,
+		HTMLURL: finalPageURL,
+		Assets:  assets,
+	}, finalPageURL, nil
+}
+
+func fetchReleasePageDocument(
+	ctx context.Context,
+	client *http.Client,
+	pageURL string,
+) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create release page request: %w", err)
+	}
+	req.Header.Set("User-Agent", updateReleaseUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("request release page: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, "", fmt.Errorf("unexpected release page status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseMetadataSize+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("read release page body: %w", err)
+	}
+	if int64(len(data)) > maxReleaseMetadataSize {
+		return nil, "", fmt.Errorf("release page exceeds maximum size of %d bytes", maxReleaseMetadataSize)
+	}
+
+	finalURL := pageURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+
+	return data, finalURL, nil
+}
+
+func extractReleaseTag(pageURL string, pageData []byte) string {
+	if match := releaseTagPathPattern.FindStringSubmatch(pageURL); len(match) > 1 {
+		return strings.TrimSpace(html.UnescapeString(match[1]))
+	}
+
+	if match := releaseTagPathPattern.FindSubmatch(pageData); len(match) > 1 {
+		return strings.TrimSpace(html.UnescapeString(string(match[1])))
+	}
+
+	if match := releaseTitlePattern.FindSubmatch(pageData); len(match) > 1 {
+		return strings.TrimSpace(html.UnescapeString(string(match[1])))
+	}
+
+	return ""
+}
+
+func buildExpandedAssetsURL(repoURL string, tag string) string {
+	repositoryURL := strings.TrimSuffix(managementasset.ResolveRepositoryURL(repoURL), "/")
+	if repositoryURL == "" || strings.TrimSpace(tag) == "" {
+		return ""
+	}
+
+	return repositoryURL + "/releases/expanded_assets/" + url.PathEscape(strings.TrimSpace(tag))
+}
+
+func parseReleaseAssetsFromHTML(data []byte, pageURL string) []releaseAsset {
+	baseURL, err := url.Parse(pageURL)
+	if err != nil {
+		baseURL = nil
+	}
+
+	rows := releaseAssetRowPattern.FindAllSubmatch(data, -1)
+	if len(rows) == 0 {
+		return nil
+	}
+
+	assets := make([]releaseAsset, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+
+	for _, rowMatch := range rows {
+		if len(rowMatch) < 2 {
+			continue
+		}
+		row := rowMatch[1]
+
+		hrefMatch := releaseAssetHrefPattern.FindSubmatch(row)
+		if len(hrefMatch) < 2 {
+			continue
+		}
+
+		rawHref := strings.TrimSpace(html.UnescapeString(string(hrefMatch[1])))
+		downloadURL := rawHref
+		if baseURL != nil {
+			if parsedHref, errParse := url.Parse(rawHref); errParse == nil {
+				downloadURL = baseURL.ResolveReference(parsedHref).String()
+			}
+		}
+
+		name := ""
+		if nameMatch := releaseAssetNamePattern.FindSubmatch(row); len(nameMatch) > 1 {
+			name = strings.TrimSpace(html.UnescapeString(string(nameMatch[1])))
+		}
+		if name == "" {
+			if parsedHref, errParse := url.Parse(rawHref); errParse == nil {
+				if decodedName, errDecode := url.PathUnescape(path.Base(parsedHref.Path)); errDecode == nil {
+					name = strings.TrimSpace(decodedName)
+				}
+			}
+		}
+		if name == "" {
+			continue
+		}
+
+		normalizedName := strings.ToLower(name)
+		if _, exists := seen[normalizedName]; exists {
+			continue
+		}
+		seen[normalizedName] = struct{}{}
+
+		digest := ""
+		if digestMatch := releaseAssetDigestPattern.FindSubmatch(row); len(digestMatch) > 1 {
+			digest = "sha256:" + strings.ToLower(strings.TrimSpace(string(digestMatch[1])))
+		}
+
+		assets = append(assets, releaseAsset{
+			Name:               name,
+			BrowserDownloadURL: downloadURL,
+			Digest:             digest,
+		})
+	}
+
+	return assets
 }
 
 func (h *Handler) prepareUpdate(ctx context.Context, release *githubReleaseInfo, archiveAsset *releaseAsset) (*preparedUpdate, error) {
