@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -58,6 +59,7 @@ type scheduledAuthMeta struct {
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
+	providerKey     string
 	modelKey        string
 	entries         map[string]*scheduledAuth
 	priorityOrder   []int
@@ -638,6 +640,7 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		return shard
 	}
 	shard := &modelScheduler{
+		providerKey:     p.providerKey,
 		modelKey:        modelKey,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
@@ -815,9 +818,12 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		view = &bucket.ws
 	}
 	var picked *scheduledAuth
-	if strategy == schedulerStrategyFillFirst {
+	if strategy == schedulerStrategyRoundRobin {
+		picked = pickComparableQuotaBalancedReady(view, predicate)
+	}
+	if picked == nil && strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
-	} else {
+	} else if picked == nil {
 		picked = view.pickRoundRobin(predicate)
 	}
 	if picked == nil || picked.auth == nil {
@@ -1025,6 +1031,41 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		return entry
 	}
 	return nil
+}
+
+func pickComparableQuotaBalancedReady(view *readyView, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	if view == nil {
+		return nil
+	}
+	now := time.Now()
+	bestUsedPercent := 101.0
+	hasComparableCandidate := false
+	for _, entry := range view.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		usedPercent, ok := comparablePrimaryQuotaUsedPercent(entry.auth, now)
+		if !ok {
+			continue
+		}
+		if !hasComparableCandidate || usedPercent < bestUsedPercent {
+			bestUsedPercent = usedPercent
+			hasComparableCandidate = true
+		}
+	}
+	if !hasComparableCandidate {
+		return nil
+	}
+	return view.pickRoundRobin(func(entry *scheduledAuth) bool {
+		if predicate != nil && !predicate(entry) {
+			return false
+		}
+		usedPercent, ok := comparablePrimaryQuotaUsedPercent(entry.auth, now)
+		if !ok {
+			return false
+		}
+		return math.Abs(usedPercent-bestUsedPercent) < 0.0001
+	})
 }
 
 // pickGroupedRoundRobin rotates across parents first and then within the selected parent.

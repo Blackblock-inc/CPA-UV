@@ -174,8 +174,10 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel context.CancelFunc
-	refreshLoop   *authAutoRefreshLoop
+	refreshCancel          context.CancelFunc
+	refreshLoop            *authAutoRefreshLoop
+	comparableQuotaCancel  context.CancelFunc
+	comparableQuotaTracker *comparableQuotaTracker
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -1110,6 +1112,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueComparableQuotaRefresh(auth.ID, true)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1141,6 +1144,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueComparableQuotaRefresh(auth.ID, true)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -2115,6 +2119,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	m.queueComparableQuotaRefresh(result.AuthID, false)
 	m.hook.OnResult(ctx, result)
 }
 
@@ -2950,6 +2955,7 @@ func (m *Manager) StopAutoRefresh() {
 	if cancel != nil {
 		cancel()
 	}
+	m.StopComparableQuotaTracking()
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
 	if stoppable, ok := m.selector.(StoppableSelector); ok {
 		stoppable.Stop()

@@ -711,6 +711,8 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		s.coreManager.StartComparableQuotaTracking(context.Background(), 90*time.Second)
+		log.Info("comparable quota tracking started")
 	}
 
 	select {

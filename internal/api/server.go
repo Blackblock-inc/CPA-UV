@@ -20,6 +20,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/access"
+	chatgptHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/chatgpt"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
@@ -336,6 +337,7 @@ func (s *Server) setupRoutes() {
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+	chatgptUsageHandlers := chatgptHandlers.NewUsageHandler(s.handlers.AuthManager)
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
@@ -350,6 +352,13 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
+
+	backendAPI := s.engine.Group("/backend-api")
+	backendAPI.Use(loopbackOnlyMiddleware())
+	{
+		backendAPI.GET("/wham/usage", chatgptUsageHandlers.GetUsage)
+	}
+	s.engine.GET("/wham/usage", loopbackOnlyMiddleware(), chatgptUsageHandlers.GetUsage)
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")

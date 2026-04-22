@@ -70,6 +70,32 @@ func registerSchedulerModels(t *testing.T, provider string, model string, authID
 	})
 }
 
+func comparableSnapshotForTest(updatedAt time.Time, primaryUsed float64, primaryAvailable bool, secondaryUsed float64, secondaryAvailable bool) *ComparableQuotaSnapshot {
+	return &ComparableQuotaSnapshot{
+		Provider:  "codex",
+		PlanType:  "pro",
+		UpdatedAt: updatedAt,
+		Windows: map[string]ComparableQuotaWindow{
+			ComparableQuotaWindowFiveHour: {
+				ID:            ComparableQuotaWindowFiveHour,
+				UsedPercent:   primaryUsed,
+				HasValue:      true,
+				Available:     primaryAvailable,
+				ResetAt:       updatedAt.Add(15 * time.Minute),
+				WindowSeconds: comparableQuotaCodexFiveHourSeconds,
+			},
+			ComparableQuotaWindowWeekly: {
+				ID:            ComparableQuotaWindowWeekly,
+				UsedPercent:   secondaryUsed,
+				HasValue:      true,
+				Available:     secondaryAvailable,
+				ResetAt:       updatedAt.Add(24 * time.Hour),
+				WindowSeconds: comparableQuotaCodexWeeklySeconds,
+			},
+		},
+	}
+}
+
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	t.Parallel()
 
@@ -231,6 +257,79 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinBalancesComparableQuotaAmongLowestUsage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-a", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 10, true, 20, true)}},
+		&Auth{ID: "codex-b", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 35, true, 40, true)}},
+		&Auth{ID: "codex-c", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 10, true, 25, true)}},
+	)
+
+	want := []string{"codex-a", "codex-c", "codex-a"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinFallsBackWhenComparableQuotaUnavailable(t *testing.T) {
+	t.Parallel()
+
+	stale := time.Now().UTC().Add(-1 * comparableQuotaSnapshotStaleAfter).Add(-1 * time.Minute)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-a", Provider: "codex"},
+		&Auth{ID: "codex-b", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(stale, 5, true, 5, true)}},
+	)
+
+	want := []string{"codex-a", "codex-b", "codex-a"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinSkipsComparableAuthWhenWeeklyQuotaExhausted(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-exhausted", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 5, false, 100, false)}},
+		&Auth{ID: "codex-ready", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 30, true, 50, true)}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-ready" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "codex-ready")
 	}
 }
 

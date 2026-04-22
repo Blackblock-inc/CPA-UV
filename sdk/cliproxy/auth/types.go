@@ -105,6 +105,27 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// Comparable carries non-persistent normalized quota data used for intelligent routing.
+	Comparable *ComparableQuotaSnapshot `json:"-"`
+}
+
+// ComparableQuotaWindow represents one normalized comparable quota window in the 0-100 used range.
+type ComparableQuotaWindow struct {
+	ID            string    `json:"-"`
+	UsedPercent   float64   `json:"-"`
+	HasValue      bool      `json:"-"`
+	Available     bool      `json:"-"`
+	ResetAt       time.Time `json:"-"`
+	WindowSeconds int       `json:"-"`
+}
+
+// ComparableQuotaSnapshot stores non-persistent normalized quota data for one auth.
+type ComparableQuotaSnapshot struct {
+	Provider  string                           `json:"-"`
+	AccountID string                           `json:"-"`
+	PlanType  string                           `json:"-"`
+	UpdatedAt time.Time                        `json:"-"`
+	Windows   map[string]ComparableQuotaWindow `json:"-"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -149,6 +170,7 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
 	}
+	copyAuth.Quota = a.Quota.Clone()
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
 }
@@ -241,6 +263,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
+	copyState.Quota = m.Quota.Clone()
 	if m.LastError != nil {
 		copyState.LastError = &Error{
 			Code:       m.LastError.Code,
@@ -250,6 +273,30 @@ func (m *ModelState) Clone() *ModelState {
 		}
 	}
 	return &copyState
+}
+
+// Clone duplicates quota state including any non-persistent comparable quota snapshot.
+func (q QuotaState) Clone() QuotaState {
+	copyQuota := q
+	if q.Comparable != nil {
+		copyQuota.Comparable = q.Comparable.Clone()
+	}
+	return copyQuota
+}
+
+// Clone duplicates a comparable quota snapshot and its window map.
+func (s *ComparableQuotaSnapshot) Clone() *ComparableQuotaSnapshot {
+	if s == nil {
+		return nil
+	}
+	copySnapshot := *s
+	if len(s.Windows) > 0 {
+		copySnapshot.Windows = make(map[string]ComparableQuotaWindow, len(s.Windows))
+		for key, value := range s.Windows {
+			copySnapshot.Windows[key] = value
+		}
+	}
+	return &copySnapshot
 }
 
 func (a *Auth) ProxyInfo() string {

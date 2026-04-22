@@ -364,3 +364,43 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToCodex_PreservesSupportedServiceTier(t *testing.T) {
+	testCases := []struct {
+		name string
+		tier string
+		want string
+	}{
+		{name: "priority", tier: "priority", want: "priority"},
+		{name: "fast", tier: "fast", want: "fast"},
+		{name: "uppercase fast", tier: "FAST", want: "fast"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			inputJSON := []byte(`{
+				"model": "gpt-5.4-mini",
+				"service_tier": "` + tc.tier + `",
+				"input": [{"role":"user","content":"hello"}]
+			}`)
+
+			output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
+			if got := gjson.GetBytes(output, "service_tier").String(); got != tc.want {
+				t.Fatalf("service_tier = %q, want %q: %s", got, tc.want, string(output))
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_RemovesUnsupportedServiceTier(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4-mini",
+		"service_tier": "standard",
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
+	if gjson.GetBytes(output, "service_tier").Exists() {
+		t.Fatalf("service_tier should be removed for unsupported tiers: %s", string(output))
+	}
+}

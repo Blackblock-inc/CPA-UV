@@ -38,6 +38,7 @@ const (
 	maxReleaseMetadataSize   = 2 << 20
 	selfExitDelay            = 1500 * time.Millisecond
 	updateInstallScriptName  = "install-update"
+	updateRunnerScriptName   = "install-update-runner"
 	updateArchiveWindowsExt  = ".zip"
 	updateArchiveUnixExt     = ".tar.gz"
 	updateExecutableBaseName = "cli-proxy-api"
@@ -609,6 +610,12 @@ func launchWindowsInstaller(prepared *preparedUpdate) error {
 		return fmt.Errorf("write windows install script: %w", err)
 	}
 
+	runnerScriptPath := filepath.Join(prepared.workDir, updateRunnerScriptName+".ps1")
+	runnerScript := buildWindowsInstallerRunnerScript()
+	if err := os.WriteFile(runnerScriptPath, []byte(runnerScript), 0o600); err != nil {
+		return fmt.Errorf("write windows install runner script: %w", err)
+	}
+
 	cmd := exec.Command(
 		"powershell",
 		"-NoProfile",
@@ -617,7 +624,8 @@ func launchWindowsInstaller(prepared *preparedUpdate) error {
 		"-WindowStyle",
 		"Hidden",
 		"-File",
-		scriptPath,
+		runnerScriptPath,
+		"-InstallerScriptPath", scriptPath,
 		"-ParentPid", fmt.Sprintf("%d", os.Getpid()),
 		"-ExecutablePath", prepared.executablePath,
 		"-ReplacementPath", prepared.replacementExecPath,
@@ -629,6 +637,48 @@ func launchWindowsInstaller(prepared *preparedUpdate) error {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Start()
+}
+
+func buildWindowsInstallerRunnerScript() string {
+	return `param(
+  [string]$InstallerScriptPath,
+  [int]$ParentPid,
+  [string]$ExecutablePath,
+  [string]$ReplacementPath,
+  [string]$PanelPath,
+  [string]$PanelTarget,
+  [string]$ArgsPath,
+  [string]$WorkingDirectory
+)
+
+$ErrorActionPreference = 'Stop'
+$logPath = Join-Path $PSScriptRoot 'install-update-runner.log'
+
+function Write-RunnerLog {
+  param([string]$Message)
+  $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+  Add-Content -LiteralPath $logPath -Value "[$timestamp] $Message"
+}
+
+Write-RunnerLog("runner starting for $ExecutablePath")
+
+$argumentList = @(
+  '-NoProfile',
+  '-ExecutionPolicy', 'Bypass',
+  '-WindowStyle', 'Hidden',
+  '-File', $InstallerScriptPath,
+  '-ParentPid', "$ParentPid",
+  '-ExecutablePath', $ExecutablePath,
+  '-ReplacementPath', $ReplacementPath,
+  '-PanelPath', $PanelPath,
+  '-PanelTarget', $PanelTarget,
+  '-ArgsPath', $ArgsPath,
+  '-WorkingDirectory', $WorkingDirectory
+)
+
+Start-Process -FilePath 'powershell' -ArgumentList $argumentList -WindowStyle Hidden -WorkingDirectory $PSScriptRoot | Out-Null
+Write-RunnerLog('runner handed off installer successfully')
+`
 }
 
 func buildWindowsInstallerScript() string {

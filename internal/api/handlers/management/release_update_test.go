@@ -107,3 +107,21 @@ func TestBuildWindowsInstallerScript(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildWindowsInstallerRunnerScript(t *testing.T) {
+	t.Parallel()
+
+	script := buildWindowsInstallerRunnerScript()
+	requiredSnippets := []string{
+		"$logPath = Join-Path $PSScriptRoot 'install-update-runner.log'",
+		"'-File', $InstallerScriptPath",
+		"Start-Process -FilePath 'powershell'",
+		"runner handed off installer successfully",
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(script, snippet) {
+			t.Fatalf("buildWindowsInstallerRunnerScript() missing %q", snippet)
+		}
+	}
+}

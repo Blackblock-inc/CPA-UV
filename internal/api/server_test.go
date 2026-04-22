@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -82,6 +83,116 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestBackendAPIWhamUsage_LocalLoopbackReturnsComparableQuotaPayload(t *testing.T) {
+	server := newTestServer(t)
+
+	now := time.Now().UTC()
+	registerComparable := func(id string, primaryUsed float64, secondaryUsed float64) {
+		t.Helper()
+		_, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+			ID:       id,
+			Provider: "codex",
+			Quota: auth.QuotaState{
+				Comparable: &auth.ComparableQuotaSnapshot{
+					Provider:  "codex",
+					AccountID: id,
+					PlanType:  "pro",
+					UpdatedAt: now,
+					Windows: map[string]auth.ComparableQuotaWindow{
+						auth.ComparableQuotaWindowFiveHour: {
+							ID:            auth.ComparableQuotaWindowFiveHour,
+							UsedPercent:   primaryUsed,
+							HasValue:      true,
+							Available:     true,
+							ResetAt:       now.Add(10 * time.Minute),
+							WindowSeconds: 18_000,
+						},
+						auth.ComparableQuotaWindowWeekly: {
+							ID:            auth.ComparableQuotaWindowWeekly,
+							UsedPercent:   secondaryUsed,
+							HasValue:      true,
+							Available:     true,
+							ResetAt:       now.Add(24 * time.Hour),
+							WindowSeconds: 604_800,
+						},
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Register(%s) error = %v", id, err)
+		}
+	}
+
+	registerComparable("codex-a", 20, 50)
+	registerComparable("codex-b", 60, 70)
+
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	req.RemoteAddr = "127.0.0.1:4321"
+	rr := httptest.NewRecorder()
+
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		PlanType  string `json:"plan_type"`
+		RateLimit struct {
+			Allowed       bool `json:"allowed"`
+			LimitReached  bool `json:"limit_reached"`
+			PrimaryWindow struct {
+				UsedPercent        int `json:"used_percent"`
+				LimitWindowSeconds int `json:"limit_window_seconds"`
+			} `json:"primary_window"`
+			SecondaryWindow struct {
+				UsedPercent        int `json:"used_percent"`
+				LimitWindowSeconds int `json:"limit_window_seconds"`
+			} `json:"secondary_window"`
+		} `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+
+	if resp.PlanType != "pro" {
+		t.Fatalf("plan_type = %q, want %q", resp.PlanType, "pro")
+	}
+	if !resp.RateLimit.Allowed {
+		t.Fatalf("rate_limit.allowed = false, want true")
+	}
+	if resp.RateLimit.LimitReached {
+		t.Fatalf("rate_limit.limit_reached = true, want false")
+	}
+	if resp.RateLimit.PrimaryWindow.UsedPercent != 40 {
+		t.Fatalf("primary used_percent = %d, want %d", resp.RateLimit.PrimaryWindow.UsedPercent, 40)
+	}
+	if resp.RateLimit.PrimaryWindow.LimitWindowSeconds != 18_000 {
+		t.Fatalf("primary limit_window_seconds = %d, want %d", resp.RateLimit.PrimaryWindow.LimitWindowSeconds, 18_000)
+	}
+	if resp.RateLimit.SecondaryWindow.UsedPercent != 60 {
+		t.Fatalf("secondary used_percent = %d, want %d", resp.RateLimit.SecondaryWindow.UsedPercent, 60)
+	}
+	if resp.RateLimit.SecondaryWindow.LimitWindowSeconds != 604_800 {
+		t.Fatalf("secondary limit_window_seconds = %d, want %d", resp.RateLimit.SecondaryWindow.LimitWindowSeconds, 604_800)
+	}
+}
+
+func TestBackendAPIWhamUsage_RejectsNonLoopback(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/backend-api/wham/usage", nil)
+	req.RemoteAddr = "192.0.2.10:4321"
+	rr := httptest.NewRecorder()
+
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
 }
 
 func TestAmpProviderModelRoutes(t *testing.T) {
