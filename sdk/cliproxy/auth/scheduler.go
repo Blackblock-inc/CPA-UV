@@ -31,6 +31,12 @@ const (
 	scheduledStateDisabled
 )
 
+const (
+	comparableQuotaVirtualSelectionStep    = 1.0
+	comparableQuotaVirtualSelectionMinStep = 0.1
+	comparableQuotaVirtualSelectionMaxStep = 2.0
+)
+
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
 	mu            sync.Mutex
@@ -47,14 +53,20 @@ type providerScheduler struct {
 	modelShards map[string]*modelScheduler
 }
 
-// scheduledAuthMeta stores the immutable scheduling fields derived from an auth snapshot.
+// scheduledAuthMeta stores the scheduling fields derived from an auth snapshot plus
+// scheduler-local comparable quota prediction state.
 type scheduledAuthMeta struct {
-	auth              *Auth
-	providerKey       string
-	priority          int
-	virtualParent     string
-	websocketEnabled  bool
-	supportedModelSet map[string]struct{}
+	auth                      *Auth
+	providerKey               string
+	priority                  int
+	virtualParent             string
+	websocketEnabled          bool
+	supportedModelSet         map[string]struct{}
+	comparableVirtualUsage    float64
+	comparableSelectionStep   float64
+	comparableCompletedCount  int
+	lastComparablePrimaryUsed float64
+	hasComparablePrimaryUsed  bool
 }
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
@@ -236,6 +248,32 @@ func (s *authScheduler) removeAuth(authID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeAuthLocked(authID)
+}
+
+func (s *authScheduler) markComparableCompletion(authID string) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	providerKey, ok := s.authProviders[authID]
+	if !ok {
+		return
+	}
+	providerState := s.providers[providerKey]
+	if providerState == nil {
+		return
+	}
+	meta := providerState.auths[authID]
+	if meta == nil || meta.auth == nil || meta.auth.Quota.Comparable == nil {
+		return
+	}
+	meta.markComparableCompletion()
 }
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
@@ -564,13 +602,17 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 	if auth.Attributes != nil {
 		virtualParent = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])
 	}
+	lastComparablePrimaryUsed, hasComparablePrimaryUsed := comparablePrimaryQuotaReportedPercent(auth)
 	return &scheduledAuthMeta{
-		auth:              auth,
-		providerKey:       providerKey,
-		priority:          authPriority(auth),
-		virtualParent:     virtualParent,
-		websocketEnabled:  authWebsocketsEnabled(auth),
-		supportedModelSet: supportedModelSetForAuth(auth.ID),
+		auth:                      auth,
+		providerKey:               providerKey,
+		priority:                  authPriority(auth),
+		virtualParent:             virtualParent,
+		websocketEnabled:          authWebsocketsEnabled(auth),
+		supportedModelSet:         supportedModelSetForAuth(auth.ID),
+		comparableSelectionStep:   comparableQuotaVirtualSelectionStep,
+		lastComparablePrimaryUsed: lastComparablePrimaryUsed,
+		hasComparablePrimaryUsed:  hasComparablePrimaryUsed,
 	}
 }
 
@@ -602,6 +644,9 @@ func supportedModelSetForAuth(authID string) map[string]struct{} {
 func (p *providerScheduler) upsertAuthLocked(meta *scheduledAuthMeta, now time.Time) {
 	if p == nil || meta == nil || meta.auth == nil {
 		return
+	}
+	if previousMeta := p.auths[meta.auth.ID]; previousMeta != nil {
+		meta.carryComparablePredictionFrom(previousMeta)
 	}
 	p.auths[meta.auth.ID] = meta
 	for modelKey, shard := range p.modelShards {
@@ -971,6 +1016,96 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 	return bucket
 }
 
+func comparablePrimaryQuotaReportedPercent(auth *Auth) (float64, bool) {
+	if auth == nil || auth.Quota.Comparable == nil {
+		return 0, false
+	}
+	window, ok := auth.Quota.Comparable.Windows[ComparableQuotaWindowFiveHour]
+	if !ok || !window.HasValue {
+		return 0, false
+	}
+	return clampComparableUsedPercent(window.UsedPercent), true
+}
+
+func clampComparableSelectionStep(step float64) float64 {
+	if math.IsNaN(step) || math.IsInf(step, 0) || step <= 0 {
+		return comparableQuotaVirtualSelectionStep
+	}
+	if step < comparableQuotaVirtualSelectionMinStep {
+		return comparableQuotaVirtualSelectionMinStep
+	}
+	if step > comparableQuotaVirtualSelectionMaxStep {
+		return comparableQuotaVirtualSelectionMaxStep
+	}
+	return step
+}
+
+func (m *scheduledAuthMeta) effectiveComparableSelectionStep() float64 {
+	if m == nil {
+		return comparableQuotaVirtualSelectionStep
+	}
+	return clampComparableSelectionStep(m.comparableSelectionStep)
+}
+
+func (m *scheduledAuthMeta) markComparableCompletion() {
+	if m == nil {
+		return
+	}
+	m.comparableCompletedCount++
+}
+
+func (m *scheduledAuthMeta) carryComparablePredictionFrom(previous *scheduledAuthMeta) {
+	if m == nil || previous == nil {
+		return
+	}
+	m.comparableVirtualUsage = previous.comparableVirtualUsage
+	m.comparableSelectionStep = previous.effectiveComparableSelectionStep()
+	m.comparableCompletedCount = previous.comparableCompletedCount
+	currentUsed, currentOK := comparablePrimaryQuotaReportedPercent(m.auth)
+	if !currentOK {
+		m.lastComparablePrimaryUsed = previous.lastComparablePrimaryUsed
+		m.hasComparablePrimaryUsed = previous.hasComparablePrimaryUsed
+		return
+	}
+
+	if previous.hasComparablePrimaryUsed {
+		if currentUsed+0.0001 < previous.lastComparablePrimaryUsed {
+			// The five-hour window likely rolled over; stale virtual pressure must be cleared.
+			m.comparableVirtualUsage = 0
+			m.comparableCompletedCount = 0
+		} else if observedDelta := currentUsed - previous.lastComparablePrimaryUsed; observedDelta > 0 {
+			m.comparableVirtualUsage = math.Max(0, previous.comparableVirtualUsage-observedDelta)
+			if previous.comparableCompletedCount > 0 {
+				m.comparableSelectionStep = clampComparableSelectionStep(observedDelta / float64(previous.comparableCompletedCount))
+			}
+			m.comparableCompletedCount = 0
+		}
+	}
+	m.lastComparablePrimaryUsed = currentUsed
+	m.hasComparablePrimaryUsed = true
+}
+
+func (m *scheduledAuthMeta) comparableEffectivePrimaryUsed(now time.Time) (float64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	usedPercent, ok := comparablePrimaryQuotaUsedPercent(m.auth, now)
+	if !ok {
+		return 0, false
+	}
+	return clampComparableUsedPercent(usedPercent + m.comparableVirtualUsage), true
+}
+
+func comparableEffectivePrimaryQuotaUsedPercent(entry *scheduledAuth, now time.Time) (float64, bool) {
+	if entry == nil || entry.auth == nil {
+		return 0, false
+	}
+	if entry.meta != nil {
+		return entry.meta.comparableEffectivePrimaryUsed(now)
+	}
+	return comparablePrimaryQuotaUsedPercent(entry.auth, now)
+}
+
 // buildReadyView creates either a flat view or a grouped parent/child view for rotation.
 func buildReadyView(entries []*scheduledAuth) readyView {
 	view := readyView{flat: append([]*scheduledAuth(nil), entries...)}
@@ -1044,7 +1179,7 @@ func pickComparableQuotaBalancedReady(view *readyView, predicate func(*scheduled
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
-		usedPercent, ok := comparablePrimaryQuotaUsedPercent(entry.auth, now)
+		usedPercent, ok := comparableEffectivePrimaryQuotaUsedPercent(entry, now)
 		if !ok {
 			continue
 		}
@@ -1056,16 +1191,20 @@ func pickComparableQuotaBalancedReady(view *readyView, predicate func(*scheduled
 	if !hasComparableCandidate {
 		return nil
 	}
-	return view.pickRoundRobin(func(entry *scheduledAuth) bool {
+	picked := view.pickRoundRobin(func(entry *scheduledAuth) bool {
 		if predicate != nil && !predicate(entry) {
 			return false
 		}
-		usedPercent, ok := comparablePrimaryQuotaUsedPercent(entry.auth, now)
+		usedPercent, ok := comparableEffectivePrimaryQuotaUsedPercent(entry, now)
 		if !ok {
 			return false
 		}
 		return math.Abs(usedPercent-bestUsedPercent) < 0.0001
 	})
+	if picked != nil && picked.meta != nil {
+		picked.meta.comparableVirtualUsage = clampComparableUsedPercent(picked.meta.comparableVirtualUsage + picked.meta.effectiveComparableSelectionStep())
+	}
+	return picked
 }
 
 // pickGroupedRoundRobin rotates across parents first and then within the selected parent.

@@ -124,6 +124,9 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// CodexAppServerProxy mounts a websocket-to-stdio Codex app-server wrapper on CPA's root path.
+	CodexAppServerProxy CodexAppServerProxy `yaml:"codex-app-server-proxy" json:"codex-app-server-proxy"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -289,6 +292,32 @@ type AmpCode struct {
 	// ForceModelMappings when true, model mappings take precedence over local API keys.
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
+}
+
+// CodexAppServerProxy configures CPA's Codex app-server wrapper.
+// When enabled, websocket upgrades on the root path (`/`) spawn `codex app-server --listen stdio://`
+// as a child process and proxy JSON-RPC traffic through CPA, allowing selective response rewriting.
+type CodexAppServerProxy struct {
+	// Enable toggles the wrapper on CPA's root websocket endpoint.
+	Enable bool `yaml:"enable" json:"enable"`
+
+	// RestrictToLocalhost blocks non-loopback websocket clients when true.
+	RestrictToLocalhost bool `yaml:"restrict-to-localhost" json:"restrict-to-localhost"`
+
+	// CodexBin overrides the binary used to launch `codex app-server`.
+	// When empty, CPA resolves `codex` from PATH.
+	CodexBin string `yaml:"codex-bin,omitempty" json:"codex-bin,omitempty"`
+
+	// AccountLabel replaces `account/read -> result.account.email` for ChatGPT auth mode.
+	// Default: "CPA-UV@limit" when the proxy is enabled.
+	AccountLabel string `yaml:"account-label,omitempty" json:"account-label,omitempty"`
+
+	// HideAccountEmail forces `account/read` to return an empty ChatGPT email field.
+	// This is useful when CPA is representing a pooled quota instead of one real account identity.
+	HideAccountEmail bool `yaml:"hide-account-email" json:"hide-account-email"`
+
+	// UsePoolPlanType rewrites `account/read -> result.account.planType` from CPA's normalized pool summary when available.
+	UsePoolPlanType bool `yaml:"use-pool-plan-type" json:"use-pool-plan-type"`
 }
 
 // AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.
@@ -608,6 +637,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
+	cfg.CodexAppServerProxy.RestrictToLocalhost = true
+	cfg.CodexAppServerProxy.UsePoolPlanType = true
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
@@ -680,6 +711,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
+
+	// Sanitize Codex app-server proxy settings.
+	cfg.SanitizeCodexAppServerProxy()
 
 	// Sanitize Claude header defaults.
 	cfg.SanitizeClaudeHeaderDefaults()
@@ -877,6 +911,18 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeCodexAppServerProxy normalizes the optional Codex app-server wrapper settings.
+func (cfg *Config) SanitizeCodexAppServerProxy() {
+	if cfg == nil {
+		return
+	}
+	cfg.CodexAppServerProxy.CodexBin = strings.TrimSpace(cfg.CodexAppServerProxy.CodexBin)
+	cfg.CodexAppServerProxy.AccountLabel = strings.TrimSpace(cfg.CodexAppServerProxy.AccountLabel)
+	if cfg.CodexAppServerProxy.Enable && !cfg.CodexAppServerProxy.HideAccountEmail && cfg.CodexAppServerProxy.AccountLabel == "" {
+		cfg.CodexAppServerProxy.AccountLabel = "CPA-UV@limit"
+	}
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

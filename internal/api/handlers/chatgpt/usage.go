@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ type UsageHandler struct {
 type rateLimitStatusPayload struct {
 	PlanType             string                  `json:"plan_type"`
 	RateLimit            *rateLimitStatusDetails `json:"rate_limit,omitempty"`
+	AdditionalRateLimits []additionalRateLimit   `json:"additional_rate_limits,omitempty"`
 	RateLimitReachedType *rateLimitReachedType   `json:"rate_limit_reached_type,omitempty"`
 }
 
@@ -39,6 +41,12 @@ type rateLimitReachedType struct {
 	Type string `json:"type"`
 }
 
+type additionalRateLimit struct {
+	LimitName      string                  `json:"limit_name"`
+	MeteredFeature string                  `json:"metered_feature"`
+	RateLimit      *rateLimitStatusDetails `json:"rate_limit,omitempty"`
+}
+
 func NewUsageHandler(authManager *coreauth.Manager) *UsageHandler {
 	return &UsageHandler{authManager: authManager}
 }
@@ -46,7 +54,7 @@ func NewUsageHandler(authManager *coreauth.Manager) *UsageHandler {
 func (h *UsageHandler) GetUsage(c *gin.Context) {
 	requestAccountID := strings.TrimSpace(c.GetHeader("Chatgpt-Account-Id"))
 	if h == nil || h.authManager == nil {
-		c.JSON(http.StatusOK, buildUsagePayload("", nil))
+		c.JSON(http.StatusOK, buildUsagePayload("", nil, nil))
 		return
 	}
 
@@ -55,10 +63,15 @@ func (h *UsageHandler) GetUsage(c *gin.Context) {
 	}
 
 	aggregate, _ := h.authManager.BuildComparableQuotaAggregate("codex", requestAccountID)
-	c.JSON(http.StatusOK, buildUsagePayload("", aggregate))
+	poolSummary, _ := h.authManager.BuildComparableQuotaPoolSummary("codex")
+	c.JSON(http.StatusOK, buildUsagePayload("", aggregate, poolSummary))
 }
 
-func buildUsagePayload(planType string, aggregate *coreauth.ComparableQuotaAggregate) rateLimitStatusPayload {
+func buildUsagePayload(
+	planType string,
+	aggregate *coreauth.ComparableQuotaAggregate,
+	poolSummary *coreauth.ComparableQuotaPoolSummary,
+) rateLimitStatusPayload {
 	if aggregate != nil {
 		planType = aggregate.PlanType
 	}
@@ -73,7 +86,19 @@ func buildUsagePayload(planType string, aggregate *coreauth.ComparableQuotaAggre
 		payload.RateLimit = rateLimit
 		payload.RateLimitReachedType = limitReachedType
 	}
+	if rateLimit := buildPoolRateLimitDetails(aggregate); rateLimit != nil {
+		payload.AdditionalRateLimits = []additionalRateLimit{{
+			LimitName:      buildPoolLimitName(poolSummary),
+			MeteredFeature: "codex",
+			RateLimit:      rateLimit,
+		}}
+	}
 	return payload
+}
+
+func buildPoolRateLimitDetails(aggregate *coreauth.ComparableQuotaAggregate) *rateLimitStatusDetails {
+	rateLimit, _ := buildRateLimitDetails(aggregate)
+	return rateLimit
 }
 
 func buildRateLimitDetails(aggregate *coreauth.ComparableQuotaAggregate) (*rateLimitStatusDetails, *rateLimitReachedType) {
@@ -168,4 +193,22 @@ func normalizePlanType(planType string) string {
 	default:
 		return "unknown"
 	}
+}
+
+func buildPoolLimitName(summary *coreauth.ComparableQuotaPoolSummary) string {
+	if summary == nil {
+		return "\u0043\u0050\u0041\u53f7\u6c60\u603b\u989d\u5ea6"
+	}
+
+	parts := []string{
+		"\u603b\u5171" + intString(summary.TotalCount),
+		"\u53ef\u7528" + intString(summary.ReadyCount),
+		"\u8017\u5c3d" + intString(summary.ExhaustedCount),
+	}
+
+	return "\u0043\u0050\u0041\u53f7\u6c60\u603b\u989d\u5ea6(" + strings.Join(parts, ",") + ")"
+}
+
+func intString(value int) string {
+	return strconv.Itoa(value)
 }

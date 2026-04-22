@@ -21,8 +21,8 @@ const (
 	ComparableQuotaWindowFiveHour = "five-hour"
 	ComparableQuotaWindowWeekly   = "weekly"
 
-	comparableQuotaDefaultInterval      = 90 * time.Second
-	comparableQuotaMinRefreshInterval   = 10 * time.Second
+	comparableQuotaDefaultInterval      = 30 * time.Second
+	comparableQuotaMinRefreshInterval   = 5 * time.Second
 	comparableQuotaSnapshotStaleAfter   = 10 * time.Minute
 	comparableQuotaRefreshTimeout       = 20 * time.Second
 	comparableQuotaDefaultWorkerCount   = 4
@@ -333,6 +333,9 @@ func (m *Manager) BuildComparableQuotaAggregate(provider string, requestAccountI
 			continue
 		}
 		if provider != "" && strings.ToLower(strings.TrimSpace(auth.Provider)) != provider {
+			continue
+		}
+		if auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
 		snapshot := auth.Quota.Comparable

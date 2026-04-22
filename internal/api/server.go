@@ -20,6 +20,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/access"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/codexappserver"
 	chatgptHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/chatgpt"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v6/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
@@ -338,6 +339,9 @@ func (s *Server) setupRoutes() {
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
 	chatgptUsageHandlers := chatgptHandlers.NewUsageHandler(s.handlers.AuthManager)
+	rootCodexAppServerProxy := codexappserver.NewRootProxyHandler(func() *config.Config {
+		return s.cfg
+	}, s.handlers.AuthManager)
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
@@ -371,6 +375,9 @@ func (s *Server) setupRoutes() {
 
 	// Root endpoint
 	s.engine.GET("/", func(c *gin.Context) {
+		if rootCodexAppServerProxy.Handle(c) {
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"message": "CLI Proxy API Server",
 			"endpoints": []string{

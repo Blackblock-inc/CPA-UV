@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -283,6 +284,75 @@ func TestSchedulerPick_RoundRobinBalancesComparableQuotaAmongLowestUsage(t *test
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinPredictsComparableQuotaPressureBeforeRefresh(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-a", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 10, true, 20, true)}},
+		&Auth{ID: "codex-b", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 11, true, 21, true)}},
+		&Auth{ID: "codex-c", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 30, true, 35, true)}},
+	)
+
+	want := []string{"codex-a", "codex-b", "codex-a"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerComparablePredictionLearnsObservedPerCompletionUsage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-a", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 10, true, 20, true)}},
+		&Auth{ID: "codex-b", Provider: "codex", Quota: QuotaState{Comparable: comparableSnapshotForTest(now, 25, true, 30, true)}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-a" {
+		t.Fatalf("pickSingle() auth = %v, want codex-a", got)
+	}
+
+	scheduler.markComparableCompletion("codex-a")
+	scheduler.markComparableCompletion("codex-a")
+	scheduler.upsertAuth(&Auth{
+		ID:       "codex-a",
+		Provider: "codex",
+		Quota: QuotaState{
+			Comparable: comparableSnapshotForTest(now.Add(30*time.Second), 10.5, true, 20.5, true),
+		},
+	})
+
+	meta := scheduler.providers["codex"].auths["codex-a"]
+	if meta == nil {
+		t.Fatalf("scheduler meta missing for codex-a")
+	}
+	if diff := math.Abs(meta.comparableSelectionStep - 0.25); diff > 0.0001 {
+		t.Fatalf("comparableSelectionStep = %v, want 0.25", meta.comparableSelectionStep)
+	}
+	if diff := math.Abs(meta.comparableVirtualUsage - 0.5); diff > 0.0001 {
+		t.Fatalf("comparableVirtualUsage = %v, want 0.5", meta.comparableVirtualUsage)
+	}
+	if meta.comparableCompletedCount != 0 {
+		t.Fatalf("comparableCompletedCount = %d, want 0", meta.comparableCompletedCount)
 	}
 }
 

@@ -121,6 +121,18 @@ routing:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 
+# Optional: mount a Codex app-server wrapper on CPA root websocket (`ws://host:port`).
+# This is intended for `codex --remote ws://127.0.0.1:8317`.
+# When enabled, CPA spawns `codex app-server --listen stdio://` per websocket session
+# and rewrites `account/read` so the TUI does not display a misleading single-account email.
+# codex-app-server-proxy:
+#   enable: true
+#   restrict-to-localhost: true
+#   codex-bin: "codex"          # optional: absolute path or binary name in PATH
+#   account-label: "CPA-UV@limit"
+#   hide-account-email: false   # optional: force Account to display an empty value
+#   use-pool-plan-type: true
+
 # When true, enable Gemini CLI internal endpoints (/v1internal:*).
 # Default is false for safety.
 enable-gemini-cli-endpoint: false

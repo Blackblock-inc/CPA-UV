@@ -2106,6 +2106,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
+	if m.scheduler != nil && result.Success {
+		m.scheduler.markComparableCompletion(result.AuthID)
+	}
 
 	if clearModelQuota && result.Model != "" {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
@@ -2119,7 +2122,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
-	m.queueComparableQuotaRefresh(result.AuthID, false)
+	m.queueComparableQuotaRefresh(result.AuthID, true)
 	m.hook.OnResult(ctx, result)
 }
 

@@ -1,8 +1,12 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,12 +16,85 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("CPA_TEST_HELPER_CODEX_APP_SERVER") == "1" {
+		os.Exit(runHelperCodexAppServer())
+	}
+	os.Exit(m.Run())
+}
+
+func runHelperCodexAppServer() int {
+	reader := bufio.NewReader(os.Stdin)
+	writer := bufio.NewWriter(os.Stdout)
+	writeResponse := func(idRaw []byte, result string) error {
+		_, err := fmt.Fprintf(writer, `{"id":%s,"result":%s}`+"\n", strings.TrimSpace(string(idRaw)), result)
+		if err != nil {
+			return err
+		}
+		return writer.Flush()
+	}
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0
+			}
+			return 1
+		}
+		trimmed := bytesTrimSpaceString(line)
+		if trimmed == "" {
+			continue
+		}
+
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+			return 2
+		}
+
+		var method string
+		if rawMethod, ok := envelope["method"]; ok {
+			if err := json.Unmarshal(rawMethod, &method); err != nil {
+				return 3
+			}
+		}
+		idRaw, hasID := envelope["id"]
+		if !hasID {
+			continue
+		}
+
+		switch method {
+		case "initialize":
+			if err := writeResponse(idRaw, `{}`); err != nil {
+				return 4
+			}
+		case "account/read":
+			if err := writeResponse(idRaw, `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}`); err != nil {
+				return 5
+			}
+		case "account/rateLimits/read":
+			if err := writeResponse(idRaw, `{}`); err != nil {
+				return 6
+			}
+		default:
+			if err := writeResponse(idRaw, `{}`); err != nil {
+				return 7
+			}
+		}
+	}
+}
+
+func bytesTrimSpaceString(data []byte) string {
+	return strings.TrimSpace(string(data))
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -192,6 +269,233 @@ func TestBackendAPIWhamUsage_RejectsNonLoopback(t *testing.T) {
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
+}
+
+func TestRootRemainsHTTPWhenCodexAppServerProxyEnabled(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.CodexAppServerProxy = proxyconfig.CodexAppServerProxy{
+		Enable:              true,
+		RestrictToLocalhost: true,
+		AccountLabel:        "CPA-UV@limit",
+		UsePoolPlanType:     true,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "CLI Proxy API Server") {
+		t.Fatalf("unexpected root body: %s", rr.Body.String())
+	}
+}
+
+func TestRootCodexAppServerProxy_RewritesAccountRead(t *testing.T) {
+	server := newTestServer(t)
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable error = %v", err)
+	}
+	server.cfg.CodexAppServerProxy = proxyconfig.CodexAppServerProxy{
+		Enable:              true,
+		RestrictToLocalhost: true,
+		CodexBin:            exePath,
+		HideAccountEmail:    true,
+		UsePoolPlanType:     true,
+	}
+	t.Setenv("CPA_TEST_HELPER_CODEX_APP_SERVER", "1")
+
+	now := time.Now().UTC()
+	_, err = server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-pool-a",
+		Provider: "codex",
+		Quota: auth.QuotaState{
+			Comparable: &auth.ComparableQuotaSnapshot{
+				Provider:  "codex",
+				AccountID: "codex-pool-a",
+				PlanType:  "pro",
+				UpdatedAt: now,
+				Windows: map[string]auth.ComparableQuotaWindow{
+					auth.ComparableQuotaWindowFiveHour: {
+						ID:            auth.ComparableQuotaWindowFiveHour,
+						UsedPercent:   18,
+						HasValue:      true,
+						Available:     true,
+						ResetAt:       now.Add(30 * time.Minute),
+						WindowSeconds: 18_000,
+					},
+					auth.ComparableQuotaWindowWeekly: {
+						ID:            auth.ComparableQuotaWindowWeekly,
+						UsedPercent:   22,
+						HasValue:      true,
+						Available:     true,
+						ResetAt:       now.Add(24 * time.Hour),
+						WindowSeconds: 604_800,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Register comparable auth error = %v", err)
+	}
+
+	ts := httptest.NewServer(server.engine)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial error = %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "initialize",
+		"id":      "init-1",
+		"params": map[string]any{
+			"clientInfo": map[string]any{
+				"name":    "test-client",
+				"version": "0.0.0-test",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("initialize write error = %v", err)
+	}
+
+	_, initResponse, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("initialize read error = %v", err)
+	}
+	if !strings.Contains(string(initResponse), `"id":"init-1"`) {
+		t.Fatalf("unexpected initialize response: %s", string(initResponse))
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "initialized",
+		"params":  map[string]any{},
+	}); err != nil {
+		t.Fatalf("initialized write error = %v", err)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "account/read",
+		"id":      7,
+		"params": map[string]any{
+			"refreshToken": false,
+		},
+	}); err != nil {
+		t.Fatalf("account/read write error = %v", err)
+	}
+
+	_, accountResponse, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("account/read read error = %v", err)
+	}
+
+	var payload struct {
+		ID     int `json:"id"`
+		Result struct {
+			Account struct {
+				Type     string `json:"type"`
+				Email    string `json:"email"`
+				PlanType string `json:"planType"`
+			} `json:"account"`
+			RequiresOpenAIAuth bool `json:"requiresOpenaiAuth"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(accountResponse, &payload); err != nil {
+		t.Fatalf("account/read json.Unmarshal error = %v; body=%s", err, string(accountResponse))
+	}
+
+	if payload.ID != 7 {
+		t.Fatalf("response id = %d, want %d", payload.ID, 7)
+	}
+	if payload.Result.Account.Type != "chatgpt" {
+		t.Fatalf("account.type = %q, want %q", payload.Result.Account.Type, "chatgpt")
+	}
+	if payload.Result.Account.Email != "" {
+		t.Fatalf("account.email = %q, want empty string", payload.Result.Account.Email)
+	}
+	if payload.Result.Account.PlanType != "pro" {
+		t.Fatalf("account.planType = %q, want %q", payload.Result.Account.PlanType, "pro")
+	}
+	if !payload.Result.RequiresOpenAIAuth {
+		t.Fatalf("requiresOpenaiAuth = false, want true")
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "account/rateLimits/read",
+		"id":      8,
+		"params":  nil,
+	}); err != nil {
+		t.Fatalf("account/rateLimits/read write error = %v", err)
+	}
+
+	_, rateLimitsResponse, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("account/rateLimits/read read error = %v", err)
+	}
+
+	var ratePayload struct {
+		ID     int `json:"id"`
+		Result struct {
+			RateLimits struct {
+				LimitID   string `json:"limitId"`
+				LimitName string `json:"limitName"`
+				PlanType  string `json:"planType"`
+				Primary   struct {
+					UsedPercent        int `json:"usedPercent"`
+					WindowDurationMins int `json:"windowDurationMins"`
+				} `json:"primary"`
+				Secondary struct {
+					UsedPercent        int `json:"usedPercent"`
+					WindowDurationMins int `json:"windowDurationMins"`
+				} `json:"secondary"`
+			} `json:"rateLimits"`
+			RateLimitsByLimitID map[string]struct {
+				PlanType string `json:"planType"`
+			} `json:"rateLimitsByLimitId"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rateLimitsResponse, &ratePayload); err != nil {
+		t.Fatalf("account/rateLimits/read json.Unmarshal error = %v; body=%s", err, string(rateLimitsResponse))
+	}
+
+	if ratePayload.ID != 8 {
+		t.Fatalf("rate limits response id = %d, want %d", ratePayload.ID, 8)
+	}
+	if ratePayload.Result.RateLimits.LimitID != "codex" {
+		t.Fatalf("rateLimits.limitId = %q, want %q", ratePayload.Result.RateLimits.LimitID, "codex")
+	}
+	if ratePayload.Result.RateLimits.PlanType != "pro" {
+		t.Fatalf("rateLimits.planType = %q, want %q", ratePayload.Result.RateLimits.PlanType, "pro")
+	}
+	if ratePayload.Result.RateLimits.Primary.UsedPercent != 18 {
+		t.Fatalf("primary usedPercent = %d, want %d", ratePayload.Result.RateLimits.Primary.UsedPercent, 18)
+	}
+	if ratePayload.Result.RateLimits.Primary.WindowDurationMins != 300 {
+		t.Fatalf("primary windowDurationMins = %d, want %d", ratePayload.Result.RateLimits.Primary.WindowDurationMins, 300)
+	}
+	if ratePayload.Result.RateLimits.Secondary.UsedPercent != 22 {
+		t.Fatalf("secondary usedPercent = %d, want %d", ratePayload.Result.RateLimits.Secondary.UsedPercent, 22)
+	}
+	if ratePayload.Result.RateLimits.Secondary.WindowDurationMins != 10080 {
+		t.Fatalf("secondary windowDurationMins = %d, want %d", ratePayload.Result.RateLimits.Secondary.WindowDurationMins, 10080)
+	}
+	if len(ratePayload.Result.RateLimitsByLimitID) != 1 {
+		t.Fatalf("expected one entry in rateLimitsByLimitId, got %d", len(ratePayload.Result.RateLimitsByLimitID))
+	}
+	if ratePayload.Result.RateLimitsByLimitID["codex"].PlanType != "pro" {
+		t.Fatalf("rateLimitsByLimitId[codex].planType = %q, want %q", ratePayload.Result.RateLimitsByLimitID["codex"].PlanType, "pro")
 	}
 }
 
